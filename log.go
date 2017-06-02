@@ -2,101 +2,48 @@
 
 package graft
 
-import (
-	"bytes"
-	"crypto/sha1"
-	"encoding/json"
-	"io/ioutil"
-	"os"
-)
+// Log allows users to override the log implementation of GRAFT, specifically
+// to allow the retrieval and comparison of history (log entries).
+type Log interface {
 
-type envelope struct {
-	SHA, Data []byte
-}
-type persistentState struct {
-	CurrentTerm uint64
-	VotedFor    string
-}
+	// LatestEntry returns the term, last voted for, last index and latest entry in the log
+	LatestEntry() (term uint64, votedFor string, lastIndex uint64, logInfo []byte, err error)
 
-func (n *Node) initLog(path string) error {
-	if log, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE, 0660); err != nil {
-		return err
-	} else {
-		log.Close()
-	}
+	// LogUpToDate returns true if the candidate log is up to date, false otherwise.
+	LogUpToDate(index uint64, info []byte, candidateIndex uint64, candidateInfo []byte) bool
 
-	n.logPath = path
+	// AppendEntry appends to the log (or sets the last entry)
+	// TODO:  This implementation does not pass an index and entry, they should be ignored and obtained elsewhere
+	// by the Log implementor?  Leave for future?
+	AppendEntry(term uint64, votedFor string, index uint64, entry []byte) error
 
-	ps, err := n.readState(path)
-	if err != nil && err != LogNoStateErr {
-		return err
-	}
-
-	if ps != nil {
-		n.setTerm(ps.CurrentTerm)
-		n.setVote(ps.VotedFor)
-	}
-
-	return nil
+	// Closes the log, freeing resources
+	Close() error
 }
 
 func (n *Node) closeLog() error {
-	err := os.Remove(n.logPath)
+	err := n.log.Close()
 	n.logPath = ""
 	return err
 }
 
+// writeState writes the current state.  Note that lastIndex and lastEntry will not
+// change here in this implementation, so they are not passed.
 func (n *Node) writeState() error {
-	n.mu.Lock()
-	ps := persistentState{
-		CurrentTerm: n.term,
-		VotedFor:    n.vote,
-	}
-	logPath := n.logPath
-	n.mu.Unlock()
-
-	buf, err := json.Marshal(ps)
-	if err != nil {
-		return err
-	}
-
-	// Set a SHA1 to test for corruption on read
-	env := envelope{
-		SHA:  sha1.New().Sum(buf),
-		Data: buf,
-	}
-
-	toWrite, err := json.Marshal(env)
-	if err != nil {
-		return err
-	}
-
-	return ioutil.WriteFile(logPath, toWrite, 0660)
+	return n.log.AppendEntry(n.term, n.vote, 0, nil)
 }
 
-func (n *Node) readState(path string) (*persistentState, error) {
-	buf, err := ioutil.ReadFile(path)
-	if err != nil {
-		return nil, err
-	}
-	if len(buf) <= 0 {
-		return nil, LogNoStateErr
+func (n *Node) readState() error {
+	currentTerm, lastVoted, lastIndex, logInfo, err := n.log.LatestEntry()
+	if err != nil && err != LogNoStateErr {
+		return err
 	}
 
-	env := &envelope{}
-	if err := json.Unmarshal(buf, env); err != nil {
-		return nil, err
-	}
+	// Update our state from the log
+	n.setTerm(currentTerm)
+	n.setVote(lastVoted)
+	n.SetLastIndex(lastIndex)
+	n.SetLogInfo(logInfo)
 
-	// Test for corruption
-	sha := sha1.New().Sum(env.Data)
-	if !bytes.Equal(sha, env.SHA) {
-		return nil, LogCorruptErr
-	}
-
-	ps := &persistentState{}
-	if err := json.Unmarshal(env.Data, ps); err != nil {
-		return nil, err
-	}
-	return ps, nil
+	return nil
 }

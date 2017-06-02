@@ -3,6 +3,8 @@
 package graft
 
 import (
+	"bytes"
+	"crypto/sha1"
 	"encoding/json"
 	"io/ioutil"
 	"os"
@@ -155,7 +157,7 @@ func TestCorruption(t *testing.T) {
 	}
 
 	// Make sure we get the corruptError
-	_, err = node.readState(node.logPath)
+	err = node.readState()
 	if err == nil {
 		t.Fatal("Expected an error reading corrupt state")
 	}
@@ -164,12 +166,39 @@ func TestCorruption(t *testing.T) {
 	}
 }
 
+func readLog(path string) (*persistentState, error) {
+	buf, err := ioutil.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	if len(buf) <= 0 {
+		return nil, LogNoStateErr
+	}
+
+	env := &envelope{}
+	if err := json.Unmarshal(buf, env); err != nil {
+		return nil, err
+	}
+
+	// Test for corruption
+	sha := sha1.New().Sum(env.Data)
+	if !bytes.Equal(sha, env.SHA) {
+		return nil, LogCorruptErr
+	}
+
+	ps := &persistentState{}
+	if err := json.Unmarshal(env.Data, ps); err != nil {
+		return nil, err
+	}
+	return ps, nil
+}
+
 // This will test that we have the correct saved state at any point in time.
 func testStateOfNode(t *testing.T, node *Node) {
 	if node == nil {
 		stackFatalf(t, "Expected a non-nil Node")
 	}
-	ps, err := node.readState(node.logPath)
+	ps, err := readLog(node.logPath)
 	if err != nil {
 		stackFatalf(t, "Err reading state: %q\n", err)
 	}

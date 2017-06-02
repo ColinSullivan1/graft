@@ -52,6 +52,12 @@ type Node struct {
 	// Who we voted for in the current term.
 	vote string
 
+	// last log index for the node
+	lastIndex uint64
+
+	// last log entry for the node
+	logInfo []byte
+
 	// Election timer.
 	electTimer *time.Timer
 
@@ -66,6 +72,9 @@ type Node struct {
 
 	// quit channel for shutdown on Close().
 	quit chan chan struct{}
+
+	// log interface
+	log Log
 }
 
 // ClusterInfo expresses the name and expected
@@ -87,11 +96,12 @@ type Handler interface {
 	StateChange(from, to State)
 }
 
-// New will create a new Graft node. All arguments are required.
-func New(info ClusterInfo, handler Handler, rpc RPCDriver, logPath string) (*Node, error) {
+// NewWithLog will create a new Graft node with a custom log implementation.
+// All arguments are required.
+func NewWithLog(info ClusterInfo, handler Handler, rpc RPCDriver, log Log) (*Node, error) {
 
 	// Check for correct Args
-	if err := checkArgs(info, handler, rpc, logPath); err != nil {
+	if err := checkArgs(info, handler, rpc, log); err != nil {
 		return nil, err
 	}
 
@@ -107,10 +117,10 @@ func New(info ClusterInfo, handler Handler, rpc RPCDriver, logPath string) (*Nod
 		VoteRequests:  make(chan *pb.VoteRequest),
 		VoteResponses: make(chan *pb.VoteResponse),
 		HeartBeats:    make(chan *pb.Heartbeat),
+		log:           log,
 	}
 
-	// Init the log file and update our state.
-	if err := node.initLog(logPath); err != nil {
+	if err := node.readState(); err != nil {
 		return nil, err
 	}
 
@@ -124,6 +134,22 @@ func New(info ClusterInfo, handler Handler, rpc RPCDriver, logPath string) (*Nod
 
 	// Loop
 	go node.loop()
+
+	return node, nil
+}
+
+// New will create a new Graft node. All arguments are required.
+func New(info ClusterInfo, handler Handler, rpc RPCDriver, logPath string) (*Node, error) {
+	if logPath == "" {
+		return nil, LogReqErr
+	}
+	node, err := NewWithLog(info, handler, rpc, NewDefaultLog(logPath))
+	if err != nil {
+		return nil, err
+	}
+
+	// Set logPath to maintiain behavior of the current LogPath() public API
+	node.logPath = logPath
 
 	return node, nil
 }
@@ -157,7 +183,7 @@ func (n *Node) clearTimers() {
 }
 
 // Make sure we have all the arguments to create the Graft node.
-func checkArgs(info ClusterInfo, handler Handler, rpc RPCDriver, logPath string) error {
+func checkArgs(info ClusterInfo, handler Handler, rpc RPCDriver, log Log) error {
 	// Check ClusterInfo
 	if info.Name == "" {
 		return ClusterNameErr
@@ -172,7 +198,7 @@ func checkArgs(info ClusterInfo, handler Handler, rpc RPCDriver, logPath string)
 	if rpc == nil {
 		return RpcDriverReqErr
 	}
-	if logPath == "" {
+	if log == nil {
 		return LogReqErr
 	}
 	return nil
@@ -247,8 +273,10 @@ func (n *Node) runAsCandidate() {
 
 	// Initiate an Election
 	vreq := &pb.VoteRequest{
-		Term:      n.term,
-		Candidate: n.id,
+		Term:         n.term,
+		Candidate:    n.id,
+		LogInfo:      n.logInfo,
+		LastLogIndex: n.lastIndex,
 	}
 	// Collect the votes.
 	// We will vote for ourselves, so start at 1.
@@ -439,65 +467,82 @@ func (n *Node) handleVoteRequest(vreq *pb.VoteRequest) bool {
 
 	deny := &pb.VoteResponse{Term: n.term, Granted: false}
 
-	// Old term, reject
-	if vreq.Term < n.term {
-		n.rpc.SendVoteResponse(vreq.Candidate, deny)
-		return false
-	}
-
-	// Save state flag
-	saveState := false
-
-	// This will trigger a return from the current runAs loop.
-	stepDown := false
-
-	// Newer term
-	if vreq.Term > n.term {
+	if n.term < vreq.Term && n.log.LogUpToDate(n.lastIndex, n.logInfo, vreq.LastLogIndex, vreq.LogInfo) {
+		n.state = FOLLOWER
 		n.term = vreq.Term
-		n.vote = NO_VOTE
-		n.leader = NO_LEADER
-		stepDown = true
-		saveState = true
-	}
+		n.setVote(vreq.Candidate)
+		n.resetElectionTimeout()
 
-	// If we are the Leader, deny request unless we have seen
-	// a newer term and must step down.
-	if n.State() == LEADER && !stepDown {
-		n.rpc.SendVoteResponse(vreq.Candidate, deny)
-		return stepDown
-	}
-
-	// If we have already cast a vote for this term, reject.
-	if n.vote != NO_VOTE && n.vote != vreq.Candidate {
-		n.rpc.SendVoteResponse(vreq.Candidate, deny)
-		return stepDown
-	}
-
-	// We will vote for this candidate.
-
-	n.setVote(vreq.Candidate)
-
-	// Write our state if needed.
-	if saveState {
 		if err := n.writeState(); err != nil {
 			// We have failed to update our state. Process the error
 			// and deny the vote.
 			n.handleError(err)
 			n.setVote(NO_VOTE)
 			n.rpc.SendVoteResponse(vreq.Candidate, deny)
-			n.resetElectionTimeout()
 			return true
 		}
+		accept := &pb.VoteResponse{Term: n.term, Granted: true}
+		n.rpc.SendVoteResponse(vreq.Candidate, accept)
+
+		return true
 	}
 
-	// Send our acceptance.
-	accept := &pb.VoteResponse{Term: n.term, Granted: true}
-	n.rpc.SendVoteResponse(vreq.Candidate, accept)
+	n.rpc.SendVoteResponse(vreq.Candidate, deny)
+	return false
+	/*
+		// Save state flag
+		saveState := false
 
-	// Reset ElectionTimeout
-	n.resetElectionTimeout()
+		// This will trigger a return from the current runAs loop.
+		stepDown := false
 
-	return stepDown
+		// Newer term
+		if vreq.Term > n.term && n.log.LogUpToDate(n.lastIndex, n.logInfo, vreq.LastLogIndex, vreq.LogInfo) {
+			n.term = vreq.Term
+			n.vote = NO_VOTE
+			n.leader = NO_LEADER
+			stepDown = true
+			saveState = true
+		}
+
+		// If we are the Leader, deny request unless we have seen
+		// a newer term and must step down.
+		if n.State() == LEADER && !stepDown {
+			n.rpc.SendVoteResponse(vreq.Candidate, deny)
+			return stepDown
+		}
+
+		// If we have already cast a vote for this term, reject.
+		if n.vote != NO_VOTE && n.vote != vreq.Candidate {
+			n.rpc.SendVoteResponse(vreq.Candidate, deny)
+			return stepDown
+		}
+
+		// We will vote for this candidate.
+		n.setVote(vreq.Candidate)
+
+		// Write our state if needed.
+		if saveState {
+			if err := n.writeState(); err != nil {
+				// We have failed to update our state. Process the error
+				// and deny the vote.
+				n.handleError(err)
+				n.setVote(NO_VOTE)
+				n.rpc.SendVoteResponse(vreq.Candidate, deny)
+				n.resetElectionTimeout()
+				return true
+			}
+		}
+
+		// Send our acceptance.
+		accept := &pb.VoteResponse{Term: n.term, Granted: true}
+		n.rpc.SendVoteResponse(vreq.Candidate, accept)
+
+		// Reset ElectionTimeout
+		n.resetElectionTimeout()
+
+		return stepDown
+	*/
 }
 
 // wonElection returns a bool to determine if we have a
@@ -677,4 +722,32 @@ func (n *Node) LogPath() string {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	return n.logPath
+}
+
+// SetLogInfo saves the last log entry on the node
+func (n *Node) SetLogInfo(entry []byte) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	n.logInfo = entry
+}
+
+// LogInfo returns the last log entry on the node
+func (n *Node) LogInfo() []byte {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	return n.logInfo
+}
+
+// SetLastIndex saves the last log index on the node
+func (n *Node) SetLastIndex(index uint64) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	n.lastIndex = index
+}
+
+// LastIndex returns the last log index on the node
+func (n *Node) LastIndex() uint64 {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	return n.lastIndex
 }

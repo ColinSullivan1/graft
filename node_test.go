@@ -3,7 +3,9 @@
 package graft
 
 import (
+	"fmt"
 	"runtime"
+	"sync"
 	"testing"
 	"time"
 )
@@ -11,32 +13,32 @@ import (
 func TestNew(t *testing.T) {
 	// Test bad ClusterInfos
 	bci := ClusterInfo{Name: "", Size: 5}
-	if _, err := New(bci, nil, nil, ""); err == nil || err != ClusterNameErr {
+	if _, err := New(bci, nil, nil, "log"); err == nil || err != ClusterNameErr {
 		t.Fatal("Expected an error with empty cluster name")
 	}
 	bci = ClusterInfo{Name: "foo", Size: 0}
-	if _, err := New(bci, nil, nil, ""); err == nil || err != ClusterSizeErr {
-		t.Fatal("Expected an error with empty cluster name")
+	if _, err := New(bci, nil, nil, "log"); err == nil || err != ClusterSizeErr {
+		t.Fatal("Expected an error with invalid cluster size")
 	}
 
 	// Good ClusterInfo
 	ci := ClusterInfo{Name: "foo", Size: 3}
 
 	// Handler is required
-	if _, err := New(ci, nil, nil, ""); err == nil || err != HandlerReqErr {
+	if _, err := New(ci, nil, nil, "log"); err == nil || err != HandlerReqErr {
 		t.Fatal("Expected an error with no handler argument")
 	}
 
 	hand, rpc, log := genNodeArgs(t)
 
 	// rpcDriver is required
-	if _, err := New(ci, hand, nil, ""); err == nil || err != RpcDriverReqErr {
+	if _, err := New(ci, hand, nil, "log"); err == nil || err != RpcDriverReqErr {
 		t.Fatal("Expected an error with no rpcDriver argument")
 	}
 
 	// Test if rpc Init fails we get error from New()
 	badRpc := &MockRpcDriver{shouldFailInit: true}
-	if _, err := New(ci, hand, badRpc, ""); err == nil {
+	if _, err := New(ci, hand, badRpc, "log"); err == nil {
 		t.Fatal("Expected an error with a bad rpcDriver argument")
 	}
 
@@ -318,4 +320,103 @@ func TestNetworkSplit(t *testing.T) {
 	mockRestoreNetwork()
 
 	expectedClusterState(t, nodes, 1, clusterSize-1, 0)
+}
+
+type TestLog struct {
+	mu        sync.Mutex
+	T         testing.T
+	Term      uint64
+	VotedFor  string
+	LastIndex uint64
+	LastEntry []byte
+	Closed    bool
+}
+
+// NewDefaultLog creates a default log that persists term and last
+// voted for.  Path is required to be valid.
+func NewTestLog(t *testing.T, lastIndex uint64, lastEntry []byte) *TestLog {
+	return &TestLog{
+		LastIndex: lastIndex,
+		LastEntry: lastEntry,
+	}
+}
+
+// Close cleans up the log and frees system resources.
+func (l *TestLog) Close() error {
+	l.Closed = true
+	return nil
+}
+
+// LatestEntry returns the last term and last voted for.  History is always
+// nil in this implementation.
+func (l *TestLog) LatestEntry() (uint64, string, uint64, []byte, error) {
+	return l.Term, l.VotedFor, l.LastIndex, l.LastEntry, nil
+}
+
+// AppendEntry saves the term and voted for values to the log.  Only one entry is
+// held in this implementation.
+func (l *TestLog) AppendEntry(term uint64, votedFor string, index uint64, entry []byte) error {
+	l.Term = term
+	l.VotedFor = votedFor
+
+	// ignore index and entry, they are set elsewhere.
+	return nil
+}
+
+// LogUpToDate compares two log indexes (local and the candidate)
+// It returns true if the candidate log is up to date, false otherwise.
+func (l *TestLog) LogUpToDate(index uint64, info []byte, candidateIndex uint64, candidateInfo []byte) bool {
+	fmt.Printf("Comparing index %d to candidateIndex %d\n", index, candidateIndex)
+	if index == candidateIndex {
+		return true
+		/*le, err := strconv.Atoi(string(localInfo))
+		if err != nil {
+			panic("unable to convert local log entry")
+		}
+		ce, err := strconv.Atoi(string(candidateInfo))
+		if err != nil {
+			panic("unable to convert local log entry")
+		}
+		if le == ce {
+			return 0
+		}
+		if le > ce {
+			return 1
+		}
+		return -1*/
+	}
+
+	return index < candidateIndex
+}
+
+func createHistoryNode(t *testing.T, ci *ClusterInfo, logIndex uint64, entry string) *Node {
+	hand, rpc, _ := genNodeArgs(t)
+	n, err := NewWithLog(*ci, hand, rpc, NewTestLog(t, logIndex, []byte(entry)))
+	if err != nil {
+		t.Fatalf("error creating node with history: %v", err)
+	}
+	return n
+}
+
+func TestLeaderFromHistory(t *testing.T) {
+	numNodes := 15
+	name := "test-cluster"
+	ci := ClusterInfo{Name: name, Size: numNodes}
+
+	nodes := make([]*Node, 0)
+	nodes = append(nodes, createHistoryNode(t, &ci, 99, ""))
+	for i := 0; i < numNodes-1; i++ {
+		nodes = append(nodes, createHistoryNode(t, &ci, uint64(i), "1"))
+	}
+
+	for _, n := range nodes {
+		defer n.Close()
+	}
+
+	expectedClusterState(t, nodes, 1, numNodes-1, 0)
+
+	leader := findLeader(nodes)
+	if leader.LastIndex() != 99 {
+		t.Fatalf("incorrect leader - index = %d", leader.LastIndex())
+	}
 }
